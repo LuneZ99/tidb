@@ -85,11 +85,105 @@ type inFunctionClass struct {
 	baseFunctionClass
 }
 
+func (c *inFunctionClass) deduplicateConstArgs(ctx BuildContext, args []Expression) []Expression {
+	if len(args) <= 2 { // No need to deduplicate if there are 0 or 1 arguments after the first one
+		return args
+	}
+
+	// The first argument is the value to check, we only deduplicate the rest
+	firstArg := args[0]
+	constArgs := args[1:]
+	
+	// Create a map to track unique values based on their string representation
+	seen := make(map[string]bool)
+	uniqueArgs := []Expression{firstArg} // Start with the first argument
+	
+	for _, arg := range constArgs {
+		// Only deduplicate constant arguments
+		if arg.ConstLevel() == ConstStrict {
+			// Get a string representation of the constant value
+			var key string
+			switch arg.GetType(ctx.GetEvalCtx()).EvalType() {
+			case types.ETInt:
+				val, isNull, err := arg.EvalInt(ctx.GetEvalCtx(), chunk.Row{})
+				if err != nil || isNull {
+					uniqueArgs = append(uniqueArgs, arg)
+					continue
+				}
+				key = fmt.Sprintf("int:%d", val)
+			case types.ETString:
+				val, isNull, err := arg.EvalString(ctx.GetEvalCtx(), chunk.Row{})
+				if err != nil || isNull {
+					uniqueArgs = append(uniqueArgs, arg)
+					continue
+				}
+				collator := collate.GetCollator(arg.GetType(ctx.GetEvalCtx()).GetCollate())
+				key = fmt.Sprintf("str:%s", string(collator.Key(val)))
+			case types.ETReal:
+				val, isNull, err := arg.EvalReal(ctx.GetEvalCtx(), chunk.Row{})
+				if err != nil || isNull {
+					uniqueArgs = append(uniqueArgs, arg)
+					continue
+				}
+				key = fmt.Sprintf("real:%f", val)
+			case types.ETDecimal:
+				val, isNull, err := arg.EvalDecimal(ctx.GetEvalCtx(), chunk.Row{})
+				if err != nil || isNull {
+					uniqueArgs = append(uniqueArgs, arg)
+					continue
+				}
+				hashKey, err := val.ToHashKey()
+				if err != nil {
+					uniqueArgs = append(uniqueArgs, arg)
+					continue
+				}
+				key = fmt.Sprintf("decimal:%s", string(hashKey))
+			case types.ETDatetime, types.ETTimestamp:
+				val, isNull, err := arg.EvalTime(ctx.GetEvalCtx(), chunk.Row{})
+				if err != nil || isNull {
+					uniqueArgs = append(uniqueArgs, arg)
+					continue
+				}
+				key = fmt.Sprintf("time:%v", val.CoreTime())
+			case types.ETDuration:
+				val, isNull, err := arg.EvalDuration(ctx.GetEvalCtx(), chunk.Row{})
+				if err != nil || isNull {
+					uniqueArgs = append(uniqueArgs, arg)
+					continue
+				}
+				key = fmt.Sprintf("duration:%v", val.Duration)
+			default:
+				// For unsupported types or non-constant expressions, keep them
+				uniqueArgs = append(uniqueArgs, arg)
+				continue
+			}
+			
+			// If we've seen this value before, skip it
+			if seen[key] {
+				continue
+			}
+			
+			// Otherwise, mark it as seen and add it to our unique arguments
+			seen[key] = true
+			uniqueArgs = append(uniqueArgs, arg)
+		} else {
+			// For non-constant arguments, always keep them
+			uniqueArgs = append(uniqueArgs, arg)
+		}
+	}
+	
+	return uniqueArgs
+}
+
 func (c *inFunctionClass) getFunction(ctx BuildContext, args []Expression) (sig builtinFunc, err error) {
 	args, err = c.verifyArgs(ctx, args)
 	if err != nil {
 		return nil, err
 	}
+	
+	// Deduplicate constant arguments to reduce gRPC message size
+	args = c.deduplicateConstArgs(ctx, args)
+	
 	argTps := make([]types.EvalType, len(args))
 	for i := range args {
 		argTps[i] = args[0].GetType(ctx.GetEvalCtx()).EvalType()
@@ -222,7 +316,10 @@ func (b *builtinInIntSig) buildHashMapForConstArgs(ctx BuildContext) error {
 				b.hasNull = true
 				continue
 			}
-			b.hashSet[val] = mysql.HasUnsignedFlag(b.args[i].GetType(ctx.GetEvalCtx()).GetFlag())
+			// Skip duplicates - only add to hashSet if not already present
+			if _, exists := b.hashSet[val]; !exists {
+				b.hashSet[val] = mysql.HasUnsignedFlag(b.args[i].GetType(ctx.GetEvalCtx()).GetFlag())
+			}
 		case ConstOnlyInContext:
 			// Avoid build plans for wrong type.
 			if _, _, err := b.args[i].EvalInt(ctx.GetEvalCtx(), chunk.Row{}); err != nil {
@@ -326,7 +423,12 @@ func (b *builtinInStringSig) buildHashMapForConstArgs(ctx BuildContext) error {
 				b.hasNull = true
 				continue
 			}
-			b.hashSet.Insert(string(collator.Key(val))) // should do memory copy here
+			// StringSet.Insert already handles duplicates, but we'll check explicitly
+			// to avoid unnecessary memory copies and collation operations
+			key := string(collator.Key(val))
+			if !b.hashSet.Exist(key) {
+				b.hashSet.Insert(key) // should do memory copy here
+			}
 		case ConstOnlyInContext:
 			// Avoid build plans for wrong type.
 			if _, _, err := b.args[i].EvalString(ctx.GetEvalCtx(), chunk.Row{}); err != nil {
@@ -410,7 +512,11 @@ func (b *builtinInRealSig) buildHashMapForConstArgs(ctx BuildContext) error {
 				b.hasNull = true
 				continue
 			}
-			b.hashSet.Insert(val)
+			// Float64Set.Insert already handles duplicates, but we'll check explicitly
+			// to avoid unnecessary operations
+			if !b.hashSet.Exist(val) {
+				b.hashSet.Insert(val)
+			}
 		case ConstOnlyInContext:
 			// Avoid build plans for wrong type.
 			if _, _, err := b.args[i].EvalReal(ctx.GetEvalCtx(), chunk.Row{}); err != nil {
@@ -496,7 +602,12 @@ func (b *builtinInDecimalSig) buildHashMapForConstArgs(ctx BuildContext) error {
 			if err != nil {
 				return err
 			}
-			b.hashSet.Insert(string(key))
+			// StringSet.Insert already handles duplicates, but we'll check explicitly
+			// to avoid unnecessary operations
+			strKey := string(key)
+			if !b.hashSet.Exist(strKey) {
+				b.hashSet.Insert(strKey)
+			}
 		case ConstOnlyInContext:
 			// Avoid build plans for wrong type.
 			if _, _, err := b.args[i].EvalDecimal(ctx.GetEvalCtx(), chunk.Row{}); err != nil {
@@ -583,7 +694,12 @@ func (b *builtinInTimeSig) buildHashMapForConstArgs(ctx BuildContext) error {
 				b.hasNull = true
 				continue
 			}
-			b.hashSet[val.CoreTime()] = struct{}{}
+			// Maps already handle duplicates, but we'll check explicitly
+			// to avoid unnecessary operations
+			coreTime := val.CoreTime()
+			if _, exists := b.hashSet[coreTime]; !exists {
+				b.hashSet[coreTime] = struct{}{}
+			}
 		case ConstOnlyInContext:
 			// Avoid build plans for wrong type.
 			if _, _, err := b.args[i].EvalTime(ctx.GetEvalCtx(), chunk.Row{}); err != nil {
@@ -665,7 +781,12 @@ func (b *builtinInDurationSig) buildHashMapForConstArgs(ctx BuildContext) error 
 				b.hasNull = true
 				continue
 			}
-			b.hashSet[val.Duration] = struct{}{}
+			// Maps already handle duplicates, but we'll check explicitly
+			// to avoid unnecessary operations
+			duration := val.Duration
+			if _, exists := b.hashSet[duration]; !exists {
+				b.hashSet[duration] = struct{}{}
+			}
 		case ConstOnlyInContext:
 			// Avoid build plans for wrong type.
 			if _, _, err := b.args[i].EvalDuration(ctx.GetEvalCtx(), chunk.Row{}); err != nil {
